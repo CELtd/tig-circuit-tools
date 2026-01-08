@@ -1,0 +1,47 @@
+[package]
+name = "tig-circuit-tools"
+version = "0.1.0"
+edition = "2021"
+authors = ["CryptoEconLab"]
+description = "Modular tools for generating and analyzing R1CS circuits for Zero-Knowledge proof systems"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/tig-circuit-tools"
+readme = "README.md"
+keywords = ["zero-knowledge", "r1cs", "circom", "spartan", "circuit"]
+categories = ["cryptography", "development-tools"]
+
+[lib]
+name = "tig_circuit_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tig-tool"
+path = "src/bin/tig-tool.rs"
+required-features = ["cli"]
+
+[dependencies]
+# Core dependencies (always included)
+rand = "0.8"
+rand_chacha = "0.3"
+sha2 = "0.10"
+curve25519-dalek = "4.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI dependencies (optional)
+clap = { version = "4", features = ["derive"], optional = true }
+indicatif = { version = "0.17", optional = true }
+regex = { version = "1.10", optional = true }
+
+[features]
+default = ["cli"]
+cli = ["clap", "indicatif", "regex"]
+
+[dev-dependencies]
+# Testing dependencies
+tempfile = "3.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
