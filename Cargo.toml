@@ -38,8 +38,9 @@ default = ["cli"]
 cli = ["clap", "indicatif", "regex"]
 
 [dev-dependencies]
-# Testing dependencies
 tempfile = "3.8"
+spartan = "0.9.0"
+merlin = "3.0"
 
 [profile.release]
 opt-level = 3
