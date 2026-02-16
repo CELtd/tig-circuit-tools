@@ -42,12 +42,11 @@ pub mod analysis;
 
 // Re-export commonly used items for convenience
 pub use dag::{CircuitConfig, Node, OpType, DAG, generate_dag};
-pub use converters::{dag_to_circom, dag_to_spartan, R1CSMatrix, SpartanInstance};
-pub use analysis::{
-    analyze_dag, analyze_spartan_instance, compare_circuits, compare_optimization_levels,
-    count_circom_constraints, count_spartan_constraints, AnalysisResult, CircomMetrics,
-    OptLevel, SpartanMetrics,
-};
+pub use converters::{compute_witness, dag_to_circom, dag_to_spartan, R1CSMatrix, SpartanInstance};
+pub use analysis::{analyze_dag, analyze_spartan_instance, compare_circuits,
+    count_spartan_constraints, AnalysisResult, SpartanMetrics};
+#[cfg(feature = "cli")]
+pub use analysis::{compare_optimization_levels, count_circom_constraints, CircomMetrics, OptLevel};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
