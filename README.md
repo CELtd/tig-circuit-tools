@@ -1,458 +1,227 @@
 # TIG Circuit Tools
 
-A modular Rust library and CLI for generating, converting, and analyzing R1CS circuits for Zero-Knowledge proof systems.
+A Rust library and CLI for generating, converting, and analyzing R1CS circuits for the TIG ZK Challenge.
 
-Built by **CryptoEconLab** for The Innovation Game (TIG) - a Zero-Knowledge proof challenge competition.
+Built by **CryptoEconLab** for [The Innovation Game (TIG)](https://github.com/tig-foundation/tig-monorepo).
 
-## Features
+> **Full pipeline documentation**: See [ZK_CHALLENGE_DOCUMENTATION.md](./ZK_CHALLENGE_DOCUMENTATION.md) for a comprehensive explanation of how this library fits into the ZK Challenge, including the verification protocol, data structures, testing, and performance profile.
 
-- **DAG Generation**: Generate random, deterministic circuit DAGs from seeds
-- **Dual Format Support**: Convert DAGs to both Circom and Spartan R1CS formats
-- **Semantic Analysis**: Identify optimization opportunities in circuits
-- **Constraint Counting**: Analyze Spartan JSON and Circom files
-- **Calibration Tools**: Statistical analysis of circuit difficulty
-- **Benchmarking**: Performance testing across difficulty tiers
+## What This Library Does
 
-## Prerequisites
+This library is the **random circuit instance generator** for the TIG ZK Challenge. The challenge asks participants to optimize R1CS circuits — reducing constraint counts while preserving functional equivalence. This library:
 
-### Required
+1. **Generates random R1CS circuits** deterministically from a cryptographic seed and difficulty parameter
+2. **Converts** the internal DAG representation to Spartan R1CS format (for ZK proving) and Circom format (for analysis)
+3. **Computes witnesses** for generated circuits, producing values that satisfy the R1CS constraints
+4. **Analyzes** circuits to measure optimization potential
 
-- **Rust** (1.70 or later): Install from [rustup.rs](https://rustup.rs/)
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  ```
+### How It Fits in the Pipeline
 
-### Optional
-
-- **Circom Compiler**: Required only for `count-circom` command and benchmarking features
-  - Install from [Circom documentation](https://docs.circom.io/getting-started/installation/)
-  ```bash
-  # Example installation (check official docs for latest method)
-  cargo install --git https://github.com/iden3/circom.git --bin circom
-  ```
-
-## Installation
-
-### Option 1: Install from Source (Recommended)
-
-```bash
-# Clone the repository
-git clone https://github.com/cryptoeconlab/tig-circuit-tools
-cd tig-circuit-tools
-
-# Build and install the CLI tool
-cargo install --path .
-
-# Or just build without installing
-cargo build --release
-# Binary will be at: ./target/release/tig-tool
+```
+seed + difficulty
+       │
+       ▼
+  tig-circuit-tools              ← THIS LIBRARY
+  ┌──────────────────────┐
+  │ generate_dag()       │  seed → SHA256 → ChaCha20 PRNG → backward BFS → DAG
+  │ dag_to_spartan()     │  DAG → sparse R1CS matrices (A, B, C)
+  │ compute_witness()    │  DAG + inputs → (private_vars, public_io)
+  └──────────┬───────────┘
+             │
+             ▼
+  tig-monorepo (zk.rs)          ← CHALLENGE PROTOCOL
+  ┌──────────────────────┐
+  │ generate_instance()  │  Creates Challenge with baseline circuit C⁰
+  │ solve_challenge()    │  Participant optimizes C⁰→C*, generates Spartan SNARK proofs
+  │ verify_solution()    │  Verifier checks K*<K⁰, output equivalence, proof validity
+  └──────────────────────┘
 ```
 
-### Option 2: Use as Library Dependency
+## Public API
 
-Add to your `Cargo.toml`:
+### Core Functions
+
+```rust
+use tig_circuit_tools::*;
+
+// Generate a circuit configuration from a difficulty scalar
+// delta=1 → ~1000 constraints, delta=2 → ~2000, etc.
+let config = CircuitConfig::from_difficulty(1);
+
+// Deterministically generate a DAG from seed + config
+let dag = generate_dag("my_seed", &config);
+
+// Convert to Spartan R1CS (for ZK proving with libspartan)
+let spartan_instance = dag_to_spartan(&dag);
+
+// Compute witness: given input scalars, evaluate the circuit
+// Returns (private_vars, public_io) ready for libspartan
+let (vars, public_io) = compute_witness(&dag, &input_scalars);
+
+// Convert to Circom (for analysis/calibration only, uses BN254 field)
+let circom_code = dag_to_circom(&dag);
+
+// Analyze optimization potential
+let analysis = analyze_dag(&dag);
+```
+
+### Key Types
+
+```rust
+// Circuit configuration
+pub struct CircuitConfig {
+    pub num_constraints: usize,   // target constraint count (delta * 1000)
+    pub redundancy_ratio: f64,    // shared subexpression density (0.25)
+    pub power_map_ratio: f64,     // x⁵ S-box frequency (0.15)
+    pub alias_ratio: f64,         // identity op frequency (0.15)
+    pub linear_ratio: f64,        // constant scaling frequency (0.20)
+}
+
+// Directed acyclic graph of circuit operations
+pub struct DAG {
+    pub nodes: Vec<Node>,
+    pub num_inputs: usize,
+    pub num_outputs: usize,
+}
+
+// Sparse R1CS instance for libspartan
+pub struct SpartanInstance {
+    pub num_cons: usize,
+    pub num_vars: usize,
+    pub num_inputs: usize,
+    pub A: R1CSMatrix,  // Vec<(row, col, [u8; 32])>
+    pub B: R1CSMatrix,
+    pub C: R1CSMatrix,
+}
+```
+
+### Operation Types and Their Optimization Potential
+
+The generator injects intentional "optimization traps" alongside core arithmetic:
+
+| Operation | Constraints | Purpose |
+|-----------|------------|---------|
+| `Add(l, r)` | 1 | Core arithmetic: `out = l + r` |
+| `Mul(l, r)` | 1 | Core arithmetic: `out = l * r` |
+| `Alias(src)` | 1 | **Trivially removable** via substitution (`out = src`) |
+| `Scale(src, k)` | 1 | **Removable** via constant folding (`out = k * src`) |
+| `Pow5(src)` | 3 | **Reducible** algebraic power map (`out = src⁵`, like Poseidon S-boxes) |
+
+With default ratios, roughly **50% of constraints are intentionally removable**.
+
+## Using as a Dependency
+
+In `Cargo.toml`:
 
 ```toml
 [dependencies]
-tig-circuit-tools = { git = "https://github.com/cryptoeconlab/tig-circuit-tools" }
+# Library only (no CLI dependencies)
+tig-circuit-tools = { git = "https://github.com/CELtd/tig-circuit-tools", default-features = false }
 ```
 
-Or if published to crates.io:
+The `tig-monorepo` (branch `zk`) uses this library in `tig-challenges/src/zk.rs` for circuit instance generation and witness computation.
 
-```toml
-[dependencies]
-tig-circuit-tools = "0.1.0"
-```
+## CLI Tool
 
-### Option 3: Library-Only (No CLI)
+Build with: `cargo build --release`
 
-To use only the library without CLI dependencies:
-
-```toml
-[dependencies]
-tig-circuit-tools = { version = "0.1.0", default-features = false }
-```
-
-## Usage
-
-### Command-Line Interface (CLI)
-
-#### 1. Generate a Circuit
-
-Generate a circuit from a seed and difficulty level:
+### Generate a Circuit
 
 ```bash
 tig-tool generate --seed "my_seed_123" --difficulty 5 --output challenge.circom
 ```
 
-**Output:**
-- `challenge.circom` - Human-readable Circom circuit code
-- `challenge.circom.spartan.json` - Spartan R1CS matrices (JSON format)
+Outputs:
+- `challenge.circom` — Circom source (for analysis with `circom --O0/O1/O2`)
+- `challenge.circom.spartan.json` — Spartan R1CS matrices (for ZK proving)
 
-**Example output:**
-```
-🔹 Generating Challenge (Dual-Head Mode)...
-✅ Saved Circom reference to challenge.circom
-✅ Saved Spartan matrices to challenge.circom.spartan.json
-   Constraints: 5023
-
-🔮 THEORETICAL ORACLE REPORT
-   Baseline Constraints: 5023
-   Spartan Constraints:  5023
-✨ PARITY CHECK PASSED: Circom and Spartan models define identical difficulty.
-
-   Alias Removable:      753
-   Linear Removable:     1005
-   Algebraic Removable:  1504
-   Total Possible Reduction: 64.89%
-```
-
-#### 2. Analyze a Spartan Circuit
-
-Extract metrics from a Spartan JSON file:
+### Analyze a Spartan Circuit
 
 ```bash
 tig-tool analyze-spartan --file challenge.circom.spartan.json
 ```
 
-**Example output:**
-```
-📊 Analyzing Spartan circuit: challenge.circom.spartan.json
-
-Spartan Metrics:
-- Total Constraints: 5023
-- Total Variables: 5842
-- Public Inputs: 892
-- Matrix A Non-zeros: 10234
-- Matrix B Non-zeros: 10234
-- Matrix C Non-zeros: 10234
-- Total Non-zeros: 30702
-- Avg Non-zeros/Constraint: 6.11
-- Sparsity Ratio: 0.000105
-```
-
-#### 3. Count Circom Constraints
-
-Run the Circom compiler to count constraints (requires `circom` installed):
+### Count Circom Constraints (requires `circom` installed)
 
 ```bash
 tig-tool count-circom --file challenge.circom --opt-level O2
 ```
 
-**Optimization levels:**
-- `O0` - No optimization (baseline)
-- `O1` - Basic optimizations
-- `O2` - Aggressive optimizations (recommended)
-
-**Example output:**
-```
-📊 Counting constraints in: challenge.circom (optimization: O2)
-
-Circom Metrics:
-- Non-linear Constraints: 3521
-- Linear Constraints: 0
-- Total Constraints: 3521
-```
-
-#### 4. Run Calibration
-
-Test consistency across multiple circuits with the same difficulty:
+### Calibrate Difficulty Consistency
 
 ```bash
 tig-tool calibrate --difficulty 5 --samples 20
 ```
 
-This generates 20 circuits with different seeds but same difficulty, measuring:
-- Raw constraint count variance
-- O1/O2 optimization consistency
-- Theoretical optimization potential
-
-**Example output:**
-```
-🔹 Running Calibration (Tier 5, Samples: 20)
-████████████████████ 20/20
-
-📈 CALIBRATION RESULTS (Difficulty 5)
-------------------------------------------------------------
-Raw Constraint Count:     5012.3 ± 48.2
-O1 Reduction:             18.42% ± 2.31%
-O2 Reduction:             29.87% ± 3.45%
-Theoretical Potential:    64.23% ± 1.89%
-```
-
-#### 5. Run Benchmark
-
-Test across multiple difficulty tiers:
+### Benchmark Across Tiers
 
 ```bash
 tig-tool benchmark --max-difficulty 10 --samples 3
 ```
 
-**Example output:**
-```
-🔹 Running Benchmark (Max Difficulty: 10, Samples: 3)
-=====================================================================================
-Tier   Raw          O1           O2           O1 Red%      O2 Red%      Potential%
--------------------------------------------------------------------------------------
-1      1024         834          716          18.55        30.08        65.23
-2      2048         1668         1432         18.55        30.08        64.87
-...
-10     10240        8340         7160         18.55        30.08        65.11
--------------------------------------------------------------------------------------
-```
-
-### Library Usage
-
-#### Basic Example: Generate and Analyze
-
-```rust
-use tig_circuit_tools::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Configure and generate DAG
-    let config = CircuitConfig::from_difficulty(5);
-    let dag = generate_dag("my_seed", &config);
-
-    println!("Generated circuit with {} nodes", dag.nodes.len());
-    println!("Total constraints: {}", dag.total_constraints());
-
-    // Step 2: Analyze the DAG
-    let analysis = analyze_dag(&dag);
-    println!("Baseline: {}", analysis.baseline_constraints);
-    println!("Removable: {} ({:.2}%)",
-        analysis.total_removable(),
-        analysis.total_possible_reduction * 100.0
-    );
-
-    // Step 3: Convert to Circom
-    let circom_code = dag_to_circom(&dag);
-    std::fs::write("circuit.circom", circom_code)?;
-
-    // Step 4: Convert to Spartan
-    let spartan = dag_to_spartan(&dag);
-    let json = serde_json::to_string_pretty(&spartan)?;
-    std::fs::write("circuit.spartan.json", json)?;
-
-    // Step 5: Verify parity
-    assert_eq!(analysis.baseline_constraints, spartan.num_cons);
-    println!("✅ Parity check passed!");
-
-    Ok(())
-}
-```
-
-#### Advanced Example: Custom Configuration
-
-```rust
-use tig_circuit_tools::*;
-
-// Create custom configuration
-let config = CircuitConfig::new(
-    2000,   // num_constraints
-    0.30,   // redundancy_ratio
-    0.20,   // power_map_ratio (Pow5 frequency)
-    0.10,   // alias_ratio (alias trap frequency)
-    0.15,   // linear_ratio (linear trap frequency)
-);
-
-let dag = generate_dag("custom_seed", &config);
-let analysis = analyze_dag(&dag);
-```
-
-#### Example: Analyze Existing Spartan File
-
-```rust
-use tig_circuit_tools::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load and analyze existing Spartan circuit
-    let metrics = count_spartan_constraints("circuit.spartan.json")?;
-
-    println!("Constraints: {}", metrics.total_constraints);
-    println!("Variables: {}", metrics.total_variables);
-    println!("Sparsity: {:.6}", metrics.sparsity_ratio());
-
-    Ok(())
-}
-```
-
-#### Example: Compare Circuits
-
-```rust
-use tig_circuit_tools::*;
-
-// Generate baseline
-let config = CircuitConfig::from_difficulty(5);
-let dag = generate_dag("seed1", &config);
-let baseline = dag_to_spartan(&dag);
-let baseline_metrics = analyze_spartan_instance(&baseline);
-
-// Simulate optimized version (in practice, you'd load an optimized circuit)
-let optimized_metrics = count_spartan_constraints("optimized.spartan.json")?;
-
-// Compare
-let comparison = compare_circuits(&baseline_metrics, &optimized_metrics);
-println!("{}", comparison);
-```
-
-## Running Examples
-
-The repository includes several complete examples:
+## Tests
 
 ```bash
-# Basic circuit generation
-cargo run --example generate_circuit
-
-# Spartan circuit analysis
-cargo run --example analyze_spartan
-
-# Complete workflow demonstration
-cargo run --example complete_workflow
-```
-
-## Architecture
-
-The library is organized into three main modules:
-
-### `dag` Module - Circuit Generation
-
-Core DAG generation functionality:
-- `CircuitConfig` - Generation parameters
-- `Node`, `OpType` - Circuit node definitions
-- `generate_dag()` - Deterministic DAG generation
-
-### `converters` Module - Format Conversion
-
-Convert DAGs to different formats:
-- `dag_to_circom()` - Generate Circom code
-- `dag_to_spartan()` - Generate R1CS matrices
-- `SpartanInstance` - R1CS representation
-
-### `analysis` Module - Circuit Analysis
-
-Analyze circuits in various formats:
-- `analyze_dag()` - Semantic analysis on DAG
-- `count_spartan_constraints()` - Parse Spartan JSON
-- `count_circom_constraints()` - Run Circom compiler
-
-## How It Works
-
-### Deterministic Generation
-
-Circuits are generated deterministically from seeds:
-
-```
-Seed → SHA256 → ChaCha20Rng → Deterministic operations
-```
-
-This enables seed-based challenge protocols without transmitting circuit files.
-
-### Backward DAG Construction
-
-The DAG grows backwards from outputs to inputs:
-
-1. Create 1-3 output nodes
-2. Expand backwards using frontier queue
-3. Randomly select operations based on configuration ratios
-4. Finalize undefined nodes as inputs
-
-This naturally creates acyclic graphs without cycle detection.
-
-### Dual Rendering
-
-The same DAG renders to two mathematically isomorphic formats:
-
-- **Circom** (BN254): Human-readable, calibratable with Circom compiler
-- **Spartan** (Curve25519): Production format for transparent proofs
-
-Both produce **identical constraint counts**.
-
-### Optimization Traps
-
-The generator intentionally injects suboptimal structures:
-
-| Operation | Cost | Optimization Potential |
-|-----------|------|------------------------|
-| **Alias** (`A = B`) | 1 constraint | Removable via substitution |
-| **Linear Scaling** (`A = k × B`) | 1 constraint | Removable via folding |
-| **Pow5** (`x^5`) | 3 constraints | Reducible to ~1 with advanced techniques |
-
-These create the "optimization game" where competitors reduce constraints.
-
-## Development
-
-### Run Tests
-
-```bash
-# All tests
+# Run all 20 tests (< 1 second)
 cargo test
 
 # With output
 cargo test -- --nocapture
-
-# Specific test
-cargo test test_determinism
 ```
 
-### Build Documentation
+### What the Tests Validate
 
-```bash
-cargo doc --open
+| Test | What it proves |
+|------|---------------|
+| `test_deterministic_generation` | Same seed → identical DAG every time |
+| `test_different_seeds_produce_different_dags` | Different seeds produce different circuits |
+| `test_constraint_count_matches_dag` | DAG constraint count == Spartan R1CS row count |
+| `test_column_bounds` | All R1CS matrix entries within valid dimensions |
+| `test_compute_witness_basic` | Witness has correct dimensions |
+| **`test_circuit_satisfiability`** | **(A*z)*(B*z)=C*z** verified via `libspartan::Instance::is_sat()` across **5 seeds x 3 difficulties** |
+
+The `test_circuit_satisfiability` test is the critical end-to-end correctness proof: it generates circuits, computes witnesses, and confirms the R1CS is satisfied.
+
+## Architecture
+
+```
+src/
+├── lib.rs                  ← Crate root, re-exports, integration tests
+├── dag/
+│   ├── config.rs           ← CircuitConfig, from_difficulty()
+│   ├── generator.rs        ← generate_dag(), DAG struct, backward BFS algorithm
+│   └── node.rs             ← Node, OpType (Add, Mul, Alias, Scale, Pow5)
+├── converters/
+│   ├── circom.rs           ← dag_to_circom() — Circom 2.0.0 output
+│   └── spartan.rs          ← dag_to_spartan(), compute_witness(), column assignment
+├── analysis/
+│   ├── dag_analysis.rs     ← analyze_dag() — optimization potential report
+│   ├── spartan_tools.rs    ← Spartan instance metrics and comparison
+│   └── circom_tools.rs     ← Circom compiler integration (requires circom binary)
+└── bin/
+    └── tig-tool.rs         ← CLI entry point
 ```
 
-### Run Clippy
+### Key Design Decisions
 
-```bash
-cargo clippy --all-targets --all-features
-```
+- **Backward BFS construction**: DAG grows from outputs (low IDs) to inputs (high IDs). Evaluating in reverse ID order gives correct topological forward order.
+- **Curve25519 scalar field**: Matches libspartan's native field. Circom output uses BN254 but is only for analysis — not for proving.
+- **Deterministic PRNG**: `SHA256(seed) → ChaCha20Rng` ensures any party can reproduce the exact same circuit from the same seed.
+- **z-vector layout**: `[private_vars | 1 | outputs... | inputs...]` following libspartan convention.
 
-### Format Code
+## Prerequisites
 
-```bash
-cargo fmt
-```
-
-## Troubleshooting
-
-### "circom: command not found"
-
-The `count-circom`, `calibrate`, and `benchmark` commands require the Circom compiler. Install it from [docs.circom.io](https://docs.circom.io/getting-started/installation/).
-
-To use the library without Circom:
-- Use only `generate`, `analyze-spartan` commands
-- Or install without CLI: `tig-circuit-tools = { version = "0.1.0", default-features = false }`
-
-### Build Errors
-
-Ensure you have:
-- Rust 1.70 or later: `rustc --version`
-- Updated dependencies: `cargo update`
-
-### Performance Issues
-
-Use release mode for production:
-```bash
-cargo build --release
-cargo run --release --bin tig-tool -- generate ...
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- **Rust** 1.70+ — install from [rustup.rs](https://rustup.rs/)
+- **Circom** (optional) — only needed for `count-circom`, `calibrate`, `benchmark` commands. Install from [docs.circom.io](https://docs.circom.io/getting-started/installation/).
 
 ## License
 
 Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
 
 ## Acknowledgments
 
 Developed by **CryptoEconLab** for The Innovation Game (TIG).
-
-## Contact
-
-For questions or support, please open an issue on GitHub.
