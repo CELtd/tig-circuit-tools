@@ -11,7 +11,8 @@ This library is the **random circuit instance generator** and **witness solver**
 1. **Generates random R1CS circuits** deterministically from a cryptographic seed and difficulty parameter
 2. **Converts** the internal DAG representation to Spartan R1CS format (for ZK proving) and Circom format (for analysis)
 3. **Computes witnesses** for any circuit — either from the DAG (`compute_witness`) or from raw R1CS matrices (`solve_witness_from_r1cs`)
-4. **Analyzes** circuits to measure optimization potential
+4. **Optimizes** circuits via `remove_aliases` — a baseline optimizer that detects and removes alias constraints directly from R1CS matrices
+5. **Analyzes** circuits to measure optimization potential
 
 ### How It Fits in the Pipeline
 
@@ -25,6 +26,7 @@ seed + difficulty
   | dag_to_spartan()             |  DAG -> sparse R1CS matrices (A, B, C)
   | compute_witness()            |  DAG + inputs -> (private_vars, public_io)
   | solve_witness_from_r1cs()    |  R1CS + inputs -> (private_vars, public_io)  [no DAG needed]
+  | remove_aliases()             |  R1CS -> optimized R1CS (alias constraints removed)
   +--------------+---------------+
                  |
                  v
@@ -103,6 +105,39 @@ pub fn solve_witness_from_r1cs(
 ) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError>
 // Returns (private_vars, public_io) same as compute_witness
 ```
+
+### Baseline Optimizer: `remove_aliases`
+
+`remove_aliases` is a reference optimizer that removes alias constraints from raw R1CS matrices. It demonstrates how participants can optimize circuits without access to the DAG.
+
+**How it works:**
+
+1. Scans each constraint row for the alias pattern: `A = [(col_out, 1)]`, `B = [(const, 1)]`, `C = [(col_src, 1)]`
+2. Builds a substitution map: `col_out → col_src` (or reversed if `col_out` is a public I/O)
+3. Resolves substitution chains (a → b → c flattened to a → c)
+4. Applies substitutions across all surviving constraints, merging duplicate columns
+5. Compacts private variable columns so `num_vars` shrinks
+
+**Usage:**
+
+```rust
+use tig_circuit_tools::*;
+
+let config = CircuitConfig::from_difficulty(1);
+let dag = generate_dag("my_seed", &config);
+let c0 = dag_to_spartan(&dag);
+
+let c_star = remove_aliases(&c0);
+// c_star.num_cons < c0.num_cons  (~13% reduction from aliases alone)
+```
+
+**Signature:**
+
+```rust
+pub fn remove_aliases(instance: &SpartanInstance) -> SpartanInstance
+```
+
+Pure function. If no aliases are found, returns a clone. The optimized circuit is compatible with `solve_witness_from_r1cs` — the solver converges on the compacted circuit.
 
 ### Key Types
 
@@ -207,7 +242,7 @@ tig-tool benchmark --max-difficulty 10 --samples 3
 ## Tests
 
 ```bash
-# Run all 21 tests (< 5 seconds)
+# Run all 22 tests (< 5 seconds)
 cargo test
 
 # With output
@@ -225,6 +260,7 @@ cargo test -- --nocapture
 | `test_compute_witness_basic` | Witness has correct dimensions |
 | **`test_circuit_satisfiability`** | **(A*z)*(B*z)=C*z** verified via `libspartan::Instance::is_sat()` across **5 seeds x 3 difficulties** |
 | **`test_solve_witness_from_r1cs`** | R1CS solver produces **byte-identical** results to DAG-based `compute_witness` across **5 seeds x 3 difficulties** |
+| **`test_remove_aliases_reduces_constraints`** | Alias removal matches expected count from DAG analysis, optimized circuit passes `is_sat()` and produces identical outputs across **5 seeds x 3 difficulties** |
 
 ## Architecture
 
@@ -237,7 +273,7 @@ src/
 |   +-- node.rs             <- Node, OpType (Add, Mul, Alias, Scale, Pow5)
 +-- converters/
 |   +-- circom.rs           <- dag_to_circom() -- Circom 2.0.0 output
-|   +-- spartan.rs          <- dag_to_spartan(), compute_witness(), solve_witness_from_r1cs()
+|   +-- spartan.rs          <- dag_to_spartan(), compute_witness(), solve_witness_from_r1cs(), remove_aliases()
 +-- analysis/
 |   +-- dag_analysis.rs     <- analyze_dag() -- optimization potential report
 |   +-- spartan_tools.rs    <- Spartan instance metrics and comparison

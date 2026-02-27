@@ -501,6 +501,194 @@ pub fn solve_witness_from_r1cs(
 }
 
 // ---------------------------------------------------------------------------
+// remove_aliases — baseline optimizer
+// ---------------------------------------------------------------------------
+
+/// Removes alias constraints from an R1CS instance via variable substitution.
+///
+/// An alias constraint has the form `out * 1 = src` in R1CS:
+///   - A: single entry `(col_out, 1)` where col_out is a private variable
+///   - B: single entry `(col_const, 1)` at the constant column
+///   - C: single entry `(col_src, 1)`
+///
+/// The function substitutes `col_out → col_src` everywhere, removes the alias
+/// rows, and compacts private variable columns so `num_vars` shrinks.
+///
+/// This is a pure function: if no aliases are found, returns a clone.
+pub fn remove_aliases(instance: &SpartanInstance) -> SpartanInstance {
+    let num_vars = instance.num_vars;
+    let const_col = num_vars; // constant 1 sits at index num_vars
+    let one_bytes = Scalar::ONE.to_bytes();
+
+    // --- Step 1: Build per-row views ---
+    let mut a_rows: Vec<Vec<(usize, [u8; 32])>> = vec![Vec::new(); instance.num_cons];
+    let mut b_rows: Vec<Vec<(usize, [u8; 32])>> = vec![Vec::new(); instance.num_cons];
+    let mut c_rows: Vec<Vec<(usize, [u8; 32])>> = vec![Vec::new(); instance.num_cons];
+
+    for &(row, col, bytes) in &instance.A {
+        a_rows[row].push((col, bytes));
+    }
+    for &(row, col, bytes) in &instance.B {
+        b_rows[row].push((col, bytes));
+    }
+    for &(row, col, bytes) in &instance.C {
+        c_rows[row].push((col, bytes));
+    }
+
+    // --- Step 2: Detect alias rows and build substitution map ---
+    // substitution[col_out] = col_src
+    let mut substitution: HashMap<usize, usize> = HashMap::new();
+    let mut removed_rows: Vec<bool> = vec![false; instance.num_cons];
+
+    for row in 0..instance.num_cons {
+        // Check alias pattern:
+        //   A: exactly 1 entry, coeff = 1, column < num_vars (private)
+        //   B: exactly 1 entry, column = const_col, coeff = 1
+        //   C: exactly 1 entry, coeff = 1
+        if a_rows[row].len() != 1 || b_rows[row].len() != 1 || c_rows[row].len() != 1 {
+            continue;
+        }
+
+        let (a_col, a_val) = a_rows[row][0];
+        let (b_col, b_val) = b_rows[row][0];
+        let (c_col, c_val) = c_rows[row][0];
+
+        if a_val != one_bytes || b_val != one_bytes || c_val != one_bytes {
+            continue;
+        }
+        if b_col != const_col {
+            continue;
+        }
+
+        // This is an alias: a_col = c_col. Substitute away whichever is private.
+        // If a_col is private → substitute a_col → c_col
+        // If c_col is private (and a_col isn't) → substitute c_col → a_col
+        // If neither is private → can't remove this row
+        if a_col < num_vars {
+            substitution.insert(a_col, c_col);
+            removed_rows[row] = true;
+        } else if c_col < num_vars {
+            substitution.insert(c_col, a_col);
+            removed_rows[row] = true;
+        }
+    }
+
+    if substitution.is_empty() {
+        return instance.clone();
+    }
+
+    // --- Step 3: Resolve chains ---
+    // If a → b → c, flatten to a → c
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let snapshot: Vec<(usize, usize)> = substitution.iter().map(|(&k, &v)| (k, v)).collect();
+        for (key, target) in snapshot {
+            if let Some(&further) = substitution.get(&target) {
+                substitution.insert(key, further);
+                changed = true;
+            }
+        }
+    }
+
+    // --- Step 4: Apply substitutions to surviving rows ---
+    // Helper: apply substitution to a single column
+    let remap_col = |col: usize| -> usize {
+        substitution.get(&col).copied().unwrap_or(col)
+    };
+
+    // Build new flat matrices with substituted columns, skipping removed rows
+    // We also need to merge entries that land on the same (row, col) after substitution
+    let mut new_a: R1CSMatrix = Vec::new();
+    let mut new_b: R1CSMatrix = Vec::new();
+    let mut new_c: R1CSMatrix = Vec::new();
+    let mut new_row = 0usize;
+
+    for row in 0..instance.num_cons {
+        if removed_rows[row] {
+            continue;
+        }
+
+        // Process each matrix for this row, merging duplicate columns
+        fn emit_row(
+            src: &[(usize, [u8; 32])],
+            dest: &mut R1CSMatrix,
+            new_row: usize,
+            remap: &dyn Fn(usize) -> usize,
+        ) {
+            // Collect entries with remapped columns, merge duplicates
+            let mut merged: HashMap<usize, Scalar> = HashMap::new();
+            for &(col, bytes) in src {
+                let new_col = remap(col);
+                let val = Scalar::from_canonical_bytes(bytes).unwrap();
+                let entry = merged.entry(new_col).or_insert(Scalar::ZERO);
+                *entry = *entry + val;
+            }
+            for (col, val) in merged {
+                if val != Scalar::ZERO {
+                    dest.push((new_row, col, val.to_bytes()));
+                }
+            }
+        }
+
+        emit_row(&a_rows[row], &mut new_a, new_row, &remap_col);
+        emit_row(&b_rows[row], &mut new_b, new_row, &remap_col);
+        emit_row(&c_rows[row], &mut new_c, new_row, &remap_col);
+        new_row += 1;
+    }
+
+    let new_num_cons = new_row;
+
+    // --- Step 5: Column compaction (private variables only) ---
+    // Collect all private variable columns still referenced
+    let mut live_private_cols: HashSet<usize> = HashSet::new();
+    for &(_, col, _) in new_a.iter().chain(new_b.iter()).chain(new_c.iter()) {
+        if col < num_vars {
+            live_private_cols.insert(col);
+        }
+    }
+
+    // Sort and assign new sequential indices
+    let mut sorted_live: Vec<usize> = live_private_cols.into_iter().collect();
+    sorted_live.sort();
+    let new_num_vars = sorted_live.len();
+
+    // Build full column remap: old_col → new_col
+    let mut col_remap: HashMap<usize, usize> = HashMap::new();
+    for (new_idx, &old_col) in sorted_live.iter().enumerate() {
+        col_remap.insert(old_col, new_idx);
+    }
+    // Constant column: old num_vars → new_num_vars
+    col_remap.insert(const_col, new_num_vars);
+    // Public I/O columns: shift from old base to new base
+    for i in 0..instance.num_inputs {
+        let old_io_col = num_vars + 1 + i;
+        let new_io_col = new_num_vars + 1 + i;
+        col_remap.insert(old_io_col, new_io_col);
+    }
+
+    // Apply column remap to all entries
+    fn remap_matrix(mat: &mut R1CSMatrix, col_remap: &HashMap<usize, usize>) {
+        for entry in mat.iter_mut() {
+            entry.1 = col_remap[&entry.1];
+        }
+    }
+
+    remap_matrix(&mut new_a, &col_remap);
+    remap_matrix(&mut new_b, &col_remap);
+    remap_matrix(&mut new_c, &col_remap);
+
+    SpartanInstance {
+        num_cons: new_num_cons,
+        num_vars: new_num_vars,
+        num_inputs: instance.num_inputs, // public I/O count unchanged
+        A: new_a,
+        B: new_b,
+        C: new_c,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -711,6 +899,122 @@ mod satisfiability_tests {
                         a.to_bytes(),
                         b.to_bytes(),
                         "public_io[{}] mismatch for seed='{}' diff={}",
+                        i, seed, diff
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test that remove_aliases correctly detects and removes alias constraints,
+    /// and the optimized circuit is still satisfiable.
+    #[test]
+    fn test_remove_aliases_reduces_constraints() {
+        use crate::analysis::analyze_dag;
+
+        let seeds = ["test1", "test2", "test3", "validation", "edge_case"];
+        let difficulties = [1u32, 2, 4];
+
+        for seed in &seeds {
+            for &diff in &difficulties {
+                let config = CircuitConfig::from_difficulty(diff);
+                let dag = generate_dag(seed, &config);
+                let si = dag_to_spartan(&dag);
+                let analysis = analyze_dag(&dag);
+
+                let optimized = remove_aliases(&si);
+
+                // Constraint count must decrease by exactly alias_removable
+                assert_eq!(
+                    optimized.num_cons,
+                    si.num_cons - analysis.alias_removable,
+                    "Wrong constraint count for seed='{}' diff={}: expected {} - {} = {}, got {}",
+                    seed, diff, si.num_cons, analysis.alias_removable,
+                    si.num_cons - analysis.alias_removable, optimized.num_cons
+                );
+
+                // num_vars must have decreased (alias columns removed)
+                assert!(
+                    optimized.num_vars <= si.num_vars,
+                    "num_vars should not increase for seed='{}' diff={}",
+                    seed, diff
+                );
+
+                // num_inputs must be unchanged
+                assert_eq!(
+                    optimized.num_inputs, si.num_inputs,
+                    "num_inputs changed for seed='{}' diff={}",
+                    seed, diff
+                );
+
+                // Compute input count
+                let output_set: HashSet<usize> = (0..dag.num_outputs).collect();
+                let num_actual_inputs = dag
+                    .nodes
+                    .iter()
+                    .filter(|n| n.is_input() && !output_set.contains(&n.id))
+                    .count();
+
+                let input_values: Vec<Scalar> = (0..num_actual_inputs)
+                    .map(|i| Scalar::from((i + 1) as u64))
+                    .collect();
+
+                // Witness solver must converge on the optimized circuit
+                let (vars_opt, public_io_opt) =
+                    solve_witness_from_r1cs(&optimized, dag.num_outputs, &input_values)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "solve_witness_from_r1cs failed on optimized circuit \
+                                 for seed='{}' diff={}: {:?}",
+                                seed, diff, e
+                            )
+                        });
+
+                // Optimized circuit must be satisfiable
+                let inst = Instance::new(
+                    optimized.num_cons,
+                    optimized.num_vars,
+                    optimized.num_inputs,
+                    &optimized.A,
+                    &optimized.B,
+                    &optimized.C,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Instance::new failed on optimized circuit for seed='{}' diff={}: {:?}",
+                        seed, diff, e
+                    )
+                });
+
+                let vars_bytes: Vec<[u8; 32]> =
+                    vars_opt.iter().map(|s| s.to_bytes()).collect();
+                let io_bytes: Vec<[u8; 32]> =
+                    public_io_opt.iter().map(|s| s.to_bytes()).collect();
+
+                let assignment_vars = VarsAssignment::new(&vars_bytes).unwrap();
+                let assignment_inputs = InputsAssignment::new(&io_bytes).unwrap();
+
+                let sat = inst
+                    .is_sat(&assignment_vars, &assignment_inputs)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "is_sat error on optimized circuit for seed='{}' diff={}: {:?}",
+                            seed, diff, e
+                        )
+                    });
+                assert!(
+                    sat,
+                    "Optimized circuit NOT satisfiable for seed='{}' difficulty={}",
+                    seed, diff
+                );
+
+                // Public I/O outputs must match the original circuit
+                let (_, public_io_orig) = compute_witness(&dag, &input_values);
+                for i in 0..dag.num_outputs {
+                    assert_eq!(
+                        public_io_orig[i].to_bytes(),
+                        public_io_opt[i].to_bytes(),
+                        "Output {} mismatch for seed='{}' diff={}",
                         i, seed, diff
                     );
                 }
