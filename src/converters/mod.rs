@@ -8,4 +8,4 @@ mod circom;
 mod spartan;
 
 pub use circom::dag_to_circom;
-pub use spartan::{compute_witness, dag_to_spartan, R1CSMatrix, SpartanInstance};
+pub use spartan::{compute_witness, dag_to_spartan, solve_witness_from_r1cs, R1CSMatrix, SpartanInstance, WitnessError};
