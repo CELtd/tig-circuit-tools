@@ -2,7 +2,7 @@
 
 A Rust library and CLI for generating, converting, and analyzing R1CS circuits for the TIG ZK Challenge.
 
-Built by **CryptoEconLab** for [The Innovation Game (TIG)](https://github.com/tig-foundation/tig-monorepo).
+Built by [**CryptoEconLab**](https://cryptoeconlab.com) for [The Innovation Game (TIG)](https://github.com/tig-foundation/tig-monorepo).
 
 ## What This Library Does
 
