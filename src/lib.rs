@@ -42,7 +42,7 @@ pub mod analysis;
 
 // Re-export commonly used items for convenience
 pub use dag::{CircuitConfig, Node, OpType, DAG, generate_dag};
-pub use converters::{compute_witness, dag_to_circom, dag_to_spartan, remove_aliases, solve_witness_from_r1cs, R1CSMatrix, SpartanInstance, WitnessError};
+pub use converters::{compute_witness, dag_to_circom, dag_to_spartan, remove_aliases, solve_witness_forward, solve_witness_from_r1cs, R1CSMatrix, SpartanInstance, WitnessError};
 pub use analysis::{analyze_dag, analyze_spartan_instance, compare_circuits,
     count_spartan_constraints, AnalysisResult, SpartanMetrics};
 #[cfg(feature = "cli")]

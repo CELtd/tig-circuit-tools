@@ -15,6 +15,9 @@ pub enum WitnessError {
     /// Fixed-point iteration stalled before all variables were determined.
     /// The circuit is underconstrained or malformed.
     SolverStuck { solved: usize, total: usize },
+    /// Row `row` has more than one unknown variable when reached in the forward
+    /// pass. The circuit rows are not in topological evaluation order.
+    NotInEvaluationOrder { row: usize },
 }
 
 /// Spartan R1CS instance representation
@@ -147,6 +150,10 @@ pub(crate) fn assign_columns(dag: &DAG) -> ColumnAssignment {
 /// Converts a DAG to Spartan R1CS matrices with correct libspartan variable layout.
 ///
 /// Each constraint has the form: <A,z> * <B,z> = <C,z>
+///
+/// Rows are emitted in **topological evaluation order** (reverse node-ID order):
+/// input/intermediate constraints come first, output constraints come last.
+/// This ensures a single forward pass can compute the witness without iteration.
 pub fn dag_to_spartan(dag: &DAG) -> SpartanInstance {
     let cols = assign_columns(dag);
 
@@ -155,7 +162,7 @@ pub fn dag_to_spartan(dag: &DAG) -> SpartanInstance {
     let mut c_mat: R1CSMatrix = Vec::new();
     let mut current_row: usize = 0;
 
-    for node in &dag.nodes {
+    for node in dag.nodes.iter().rev() {
         match node.op {
             OpType::Input => {} // No constraints for input nodes
 
@@ -494,6 +501,152 @@ pub fn solve_witness_from_r1cs(
     }
 
     // --- Extract results ---
+    let vars = z[..instance.num_vars].to_vec();
+    let public_io = z[instance.num_vars + 1..instance.num_vars + 1 + instance.num_inputs].to_vec();
+
+    Ok((vars, public_io))
+}
+
+// ---------------------------------------------------------------------------
+// solve_witness_forward — single-pass ordered witness solver
+// ---------------------------------------------------------------------------
+
+/// Computes the witness for an optimized R1CS circuit using a **single forward
+/// pass**, assuming constraint rows are in topological evaluation order.
+///
+/// This is the witness solver used for C* (the challenger's optimized circuit).
+/// It is strictly faster than `solve_witness_from_r1cs` (O(n) vs O(n²)) and
+/// enforces that the challenger has produced a well-ordered circuit.
+///
+/// # Topological evaluation order requirement
+///
+/// When processing row `i`, every variable that appears in the A or B matrices
+/// of that row must either be a known circuit input or have been produced by a
+/// previous row `j < i`. Exactly one variable may be unknown — the one this
+/// row computes (i.e. its output, which appears in C).
+///
+/// If row `i` has more than one unknown variable, the function immediately
+/// returns `Err(WitnessError::NotInEvaluationOrder { row: i })`. The caller
+/// (i.e. `solve_challenge`) treats this as an invalid solution.
+///
+/// # Arguments
+/// - `instance` — Sparse R1CS matrices and dimensions
+/// - `num_outputs` — How many of the `num_inputs` public I/O slots are outputs
+/// - `circuit_inputs` — Known input scalars (e.g. x_eval)
+///
+/// # Returns
+/// `(vars, public_io)` — same layout as `compute_witness`.
+pub fn solve_witness_forward(
+    instance: &SpartanInstance,
+    num_outputs: usize,
+    circuit_inputs: &[Scalar],
+) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError> {
+    let expected_inputs = instance.num_inputs - num_outputs;
+    if circuit_inputs.len() != expected_inputs {
+        return Err(WitnessError::InvalidInputs {
+            expected: expected_inputs,
+            got: circuit_inputs.len(),
+        });
+    }
+
+    // --- Pre-process: group matrix entries by row ---
+    let mut a_rows: Vec<Vec<(usize, Scalar)>> = vec![Vec::new(); instance.num_cons];
+    let mut b_rows: Vec<Vec<(usize, Scalar)>> = vec![Vec::new(); instance.num_cons];
+    let mut c_rows: Vec<Vec<(usize, Scalar)>> = vec![Vec::new(); instance.num_cons];
+
+    for &(row, col, ref bytes) in &instance.A {
+        a_rows[row].push((col, Scalar::from_canonical_bytes(*bytes).unwrap()));
+    }
+    for &(row, col, ref bytes) in &instance.B {
+        b_rows[row].push((col, Scalar::from_canonical_bytes(*bytes).unwrap()));
+    }
+    for &(row, col, ref bytes) in &instance.C {
+        c_rows[row].push((col, Scalar::from_canonical_bytes(*bytes).unwrap()));
+    }
+
+    // --- Allocate z-vector and solved mask ---
+    let z_len = instance.num_vars + 1 + instance.num_inputs;
+    let mut z = vec![Scalar::ZERO; z_len];
+    let mut solved = vec![false; z_len];
+
+    z[instance.num_vars] = Scalar::ONE;
+    solved[instance.num_vars] = true;
+
+    for (i, &val) in circuit_inputs.iter().enumerate() {
+        let idx = instance.num_vars + 1 + num_outputs + i;
+        z[idx] = val;
+        solved[idx] = true;
+    }
+
+    // --- Single forward pass ---
+    for row in 0..instance.num_cons {
+        // Find the unique unsolved column (if any)
+        let mut unsolved_col: Option<usize> = None;
+        let mut multi = false;
+
+        for &(col, _) in a_rows[row].iter().chain(b_rows[row].iter()).chain(c_rows[row].iter()) {
+            if !solved[col] {
+                match unsolved_col {
+                    None => unsolved_col = Some(col),
+                    Some(prev) if prev == col => {}
+                    Some(_) => { multi = true; break; }
+                }
+            }
+        }
+
+        if multi {
+            return Err(WitnessError::NotInEvaluationOrder { row });
+        }
+
+        let j = match unsolved_col {
+            Some(j) => j,
+            None => continue, // all variables already known — row is a check, not a definition
+        };
+
+        // Solve for the single unknown j
+        let mut a_known = Scalar::ZERO;
+        let mut a_j = Scalar::ZERO;
+        for &(col, val) in &a_rows[row] {
+            if col == j { a_j += val; } else { a_known += val * z[col]; }
+        }
+
+        let mut b_known = Scalar::ZERO;
+        let mut b_j = Scalar::ZERO;
+        for &(col, val) in &b_rows[row] {
+            if col == j { b_j += val; } else { b_known += val * z[col]; }
+        }
+
+        let mut c_known = Scalar::ZERO;
+        let mut c_j = Scalar::ZERO;
+        for &(col, val) in &c_rows[row] {
+            if col == j { c_j += val; } else { c_known += val * z[col]; }
+        }
+
+        // x = (c_known - a_known * b_known) / (a_j * b_known + b_j * a_known - c_j)
+        let denom = a_j * b_known + b_j * a_known - c_j;
+        if denom == Scalar::ZERO {
+            // Degenerate constraint — cannot determine this variable.
+            // Treat as underdetermined; convergence check below will catch it.
+            continue;
+        }
+
+        z[j] = (c_known - a_known * b_known) * denom.invert();
+        solved[j] = true;
+    }
+
+    // --- Check all vars and outputs were solved ---
+    let num_need_solved = instance.num_vars + num_outputs;
+    let mut num_solved = 0;
+    for i in 0..instance.num_vars {
+        if solved[i] { num_solved += 1; }
+    }
+    for i in 0..num_outputs {
+        if solved[instance.num_vars + 1 + i] { num_solved += 1; }
+    }
+    if num_solved < num_need_solved {
+        return Err(WitnessError::SolverStuck { solved: num_solved, total: num_need_solved });
+    }
+
     let vars = z[..instance.num_vars].to_vec();
     let public_io = z[instance.num_vars + 1..instance.num_vars + 1 + instance.num_inputs].to_vec();
 

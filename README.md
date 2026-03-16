@@ -10,7 +10,7 @@ This library is the **random circuit instance generator** and **witness solver**
 
 1. **Generates random R1CS circuits** deterministically from a cryptographic seed and difficulty parameter
 2. **Converts** the internal DAG representation to Spartan R1CS format (for ZK proving) and Circom format (for analysis)
-3. **Computes witnesses** for any circuit — either from the DAG (`compute_witness`) or from raw R1CS matrices (`solve_witness_from_r1cs`)
+3. **Computes witnesses** for any circuit — either from the DAG (`compute_witness`) or from raw R1CS matrices (`solve_witness_forward` / `solve_witness_from_r1cs`)
 4. **Optimizes** circuits via `remove_aliases` — a baseline optimizer that detects and removes alias constraints directly from R1CS matrices
 5. **Analyzes** circuits to measure optimization potential
 
@@ -23,10 +23,11 @@ seed + difficulty
   tig-circuit-tools                    <-- THIS LIBRARY
   +------------------------------+
   | generate_dag()               |  seed -> SHA256 -> ChaCha20 PRNG -> backward BFS -> DAG
-  | dag_to_spartan()             |  DAG -> sparse R1CS matrices (A, B, C)
+  | dag_to_spartan()             |  DAG -> sparse R1CS matrices (rows in topological order)
   | compute_witness()            |  DAG + inputs -> (private_vars, public_io)
-  | solve_witness_from_r1cs()    |  R1CS + inputs -> (private_vars, public_io)  [no DAG needed]
-  | remove_aliases()             |  R1CS -> optimized R1CS (alias constraints removed)
+  | solve_witness_forward()      |  R1CS + inputs -> (private_vars, public_io)  [single pass, ordered rows]
+  | solve_witness_from_r1cs()    |  R1CS + inputs -> (private_vars, public_io)  [fixed-point, any order]
+  | remove_aliases()             |  R1CS -> optimized R1CS (alias constraints removed, order preserved)
   +--------------+---------------+
                  |
                  v
@@ -62,11 +63,20 @@ let spartan_instance = dag_to_spartan(&dag);
 let (vars, public_io) = compute_witness(&dag, &input_scalars);
 
 // Method 2: From raw R1CS matrices (used for optimized circuit C*)
-// No DAG needed — solves the witness by fixed-point constraint propagation
-let (vars, public_io) = solve_witness_from_r1cs(
+// Rows must be in topological evaluation order (as produced by dag_to_spartan
+// and preserved by remove_aliases). Errors immediately if order is violated.
+let (vars, public_io) = solve_witness_forward(
     &spartan_instance,
     dag.num_outputs,     // how many public I/O slots are outputs
     &input_scalars,      // known circuit inputs
+).unwrap();
+
+// Method 2b: Tolerant fixed-point solver (any row order, O(n²) worst case)
+// Use this for debugging or when row order is unknown.
+let (vars, public_io) = solve_witness_from_r1cs(
+    &spartan_instance,
+    dag.num_outputs,
+    &input_scalars,
 ).unwrap();
 
 // Both methods produce identical results for the same circuit and inputs.
@@ -78,33 +88,37 @@ let circom_code = dag_to_circom(&dag);
 let analysis = analyze_dag(&dag);
 ```
 
-### The R1CS Witness Solver
+### R1CS Witness Solvers
 
-`solve_witness_from_r1cs` is the key function that enables the participant API. It takes raw R1CS matrices and circuit inputs, and computes all intermediate values (the witness) without needing the computation graph.
+Two functions compute the witness from raw R1CS matrices without needing the DAG:
 
-**How it works:**
+#### `solve_witness_forward` (preferred, used by the challenge)
 
-1. Allocates the z-vector: `[private_vars | 1 | outputs... | inputs...]`
-2. Fills known values: the constant 1 and the circuit inputs
-3. Iterates over constraint rows. For each row with exactly one unknown variable, solves the linear equation:
-   ```
-   x = (C_known - A_known * B_known) / (a_j * B_known + b_j * A_known - c_j)
-   ```
-4. Repeats until convergence (no new variables solved in a full pass)
-5. If all variables are solved: success. If stuck: the circuit is invalid.
+Single forward pass. Requires rows in **topological evaluation order**: each row may have at most one unknown variable when reached in sequence. This is satisfied by any circuit produced by `dag_to_spartan` or `remove_aliases`. Errors immediately with `NotInEvaluationOrder { row }` if violated.
 
-The solver converges for any R1CS that represents a deterministic forward computation — which includes all DAG-generated circuits and well-formed optimized circuits. Solver failure is a built-in well-formedness check: a circuit that the solver can't propagate through doesn't compute a deterministic function and would fail verification regardless.
+```rust
+pub fn solve_witness_forward(
+    instance: &SpartanInstance,
+    num_outputs: usize,
+    circuit_inputs: &[Scalar],
+) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError>
+```
 
-**Signature:**
+O(n) — strictly one pass over all constraint rows.
+
+#### `solve_witness_from_r1cs` (tolerant, for debugging)
+
+Fixed-point iteration. Works with rows in any order — useful for debugging or validating circuits before sorting. O(n²) worst case.
 
 ```rust
 pub fn solve_witness_from_r1cs(
-    instance: &SpartanInstance,  // R1CS matrices (A, B, C) and dimensions
-    num_outputs: usize,          // outputs are unknown, placed first in public I/O
-    circuit_inputs: &[Scalar],   // known input values (e.g. x_eval)
+    instance: &SpartanInstance,
+    num_outputs: usize,
+    circuit_inputs: &[Scalar],
 ) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError>
-// Returns (private_vars, public_io) same as compute_witness
 ```
+
+Both return `(private_vars, public_io)` in the same layout as `compute_witness`.
 
 ### Baseline Optimizer: `remove_aliases`
 
@@ -137,7 +151,7 @@ let c_star = remove_aliases(&c0);
 pub fn remove_aliases(instance: &SpartanInstance) -> SpartanInstance
 ```
 
-Pure function. If no aliases are found, returns a clone. The optimized circuit is compatible with `solve_witness_from_r1cs` — the solver converges on the compacted circuit.
+Pure function. If no aliases are found, returns a clone. The optimized circuit preserves topological row order, making it compatible with `solve_witness_forward`.
 
 ### Key Types
 
@@ -172,6 +186,7 @@ pub struct SpartanInstance {
 pub enum WitnessError {
     InvalidInputs { expected: usize, got: usize },
     SolverStuck { solved: usize, total: usize },
+    NotInEvaluationOrder { row: usize },  // solve_witness_forward only
 }
 ```
 
@@ -288,7 +303,8 @@ src/
 - **Curve25519 scalar field**: Matches libspartan's native field. Circom output uses BN254 but is only for analysis -- not for proving.
 - **Deterministic PRNG**: `SHA256(seed) -> ChaCha20Rng` ensures any party can reproduce the exact same circuit from the same seed.
 - **z-vector layout**: `[private_vars | 1 | outputs... | inputs...]` following libspartan convention.
-- **Fixed-point R1CS solver**: Enables witness computation from raw R1CS matrices without the DAG, making it possible for participants to work at the R1CS level without writing custom witness generators.
+- **Topological row order**: `dag_to_spartan` emits rows in reverse node-ID order (deep dependencies first, outputs last). This guarantees a single forward pass can compute the witness. `remove_aliases` preserves this order. Challengers must preserve or restore it in their optimized C*.
+- **Two witness solvers**: `solve_witness_forward` (O(n), strict, used by the challenge protocol) and `solve_witness_from_r1cs` (O(n²), tolerant, for debugging).
 
 ## Prerequisites
 

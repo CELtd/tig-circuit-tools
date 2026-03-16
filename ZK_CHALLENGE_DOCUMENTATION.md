@@ -210,7 +210,7 @@ We need to verify that C*(x) = C⁰(x) for all inputs x. Testing all inputs is i
     1. Receive C⁰     │◄──────────── C⁰ (from seed + δ) ─────────────│
                       │                                                │
     2. Optimize        │  C* = optimize(C⁰)                            │
-                      │  (must have K* < K⁰)                          │
+                      │  (K* < K⁰, rows in topological order)         │
                       │                                                │
     3. Hash & derive   │  h₀ = Blake3(C⁰)                             │
                       │  h* = Blake3(C*)                              │
@@ -244,7 +244,7 @@ We need to verify that C*(x) = C⁰(x) for all inputs x. Testing all inputs is i
 
 ```rust
 // Hash a circuit: serialize with bincode, then Blake3 → 512-bit digest
-CryptoHash::from_circuit(circuit) → [u8; 64]
+CryptoHash::from_spartan_instance(instance) → [u8; 64]
 
 // Combine two hashes: Blake3(h₀ || h*)
 h0.combine(&h_star) → CryptoHash
@@ -270,7 +270,7 @@ tig-circuit-tools/               ← Random circuit generation library
 │   │   └── node.rs              ← Node, OpType (Add, Mul, Alias, Scale, Pow5)
 │   ├── converters/
 │   │   ├── circom.rs            ← dag_to_circom() (analysis only)
-│   │   └── spartan.rs           ← dag_to_spartan(), compute_witness()
+│   │   └── spartan.rs           ← dag_to_spartan(), compute_witness(), solve_witness_forward(), solve_witness_from_r1cs(), remove_aliases()
 │   └── analysis/                ← DAG analysis, Spartan metrics
 └── Cargo.toml
 
@@ -317,10 +317,12 @@ Build with: `cargo build --features c007 -p tig-challenges`
 
 ## 7. Data Structures
 
-### 7.1 Circuit (R1CS representation)
+### 7.1 SpartanInstance (R1CS representation)
+
+The circuit type is `SpartanInstance` from `tig-circuit-tools`, used directly in both `Challenge` and `Solution`:
 
 ```rust
-pub struct Circuit {
+pub struct SpartanInstance {
     pub num_cons: usize,     // Number of constraints (rows in A, B, C)
     pub num_vars: usize,     // Number of private variables
     pub num_inputs: usize,   // Number of public I/O values (outputs + inputs)
@@ -341,15 +343,17 @@ z = [ vars(0..num_vars-1)  |  1 (at index num_vars)  |  public_io(num_vars+1..) 
                                                           └── inputs  (after)
 ```
 
+**Row ordering requirement**: rows are in topological evaluation order — each row has at most one unknown variable when processed in sequence. `dag_to_spartan` guarantees this. Challengers must preserve it in their C*.
+
 ### 7.2 Challenge
 
 ```rust
 pub struct Challenge {
-    pub seed: [u8; 32],           // Cryptographic seed
-    pub difficulty: Difficulty,    // Contains delta: usize
-    pub circuit_c0: Circuit,       // Baseline circuit C⁰
-    pub num_circuit_inputs: usize, // Number of circuit input signals
-    pub num_circuit_outputs: usize,// Number of circuit output signals
+    pub seed: [u8; 32],                // Cryptographic seed
+    pub difficulty: Difficulty,         // Contains delta: usize
+    pub circuit_c0: SpartanInstance,   // Baseline circuit C⁰
+    pub num_circuit_inputs: usize,     // Number of circuit input signals
+    pub num_circuit_outputs: usize,    // Number of circuit output signals
 }
 ```
 
@@ -357,29 +361,23 @@ pub struct Challenge {
 
 ```rust
 pub struct Solution {
-    pub circuit_star: Circuit,     // Optimized circuit C*
-    pub y0_pub: Vec<Scalar>,       // C⁰ output values at x_eval
-    pub y_star_pub: Vec<Scalar>,   // C* output values at x_eval
-    pub proof0: SNARK,             // Spartan proof for C⁰
-    pub proof_star: SNARK,         // Spartan proof for C*
-    pub comm0: Commitment,         // Commitment to C⁰ instance
-    pub comm_star: Commitment,     // Commitment to C* instance
-    pub gens0: SNARKGens,          // Spartan generators for C⁰
-    pub gens_star: SNARKGens,      // Spartan generators for C*
+    pub circuit_star: SpartanInstance, // Optimized circuit C* (rows in topological order)
+    pub y0_pub: Vec<Scalar>,           // C⁰ output values at x_eval
+    pub y_star_pub: Vec<Scalar>,       // C* output values at x_eval
+    pub proof0: SNARK,                 // Spartan proof for C⁰
+    pub proof_star: SNARK,             // Spartan proof for C*
 }
 ```
+
+Generators and commitments are NOT in the Solution. The verifier recomputes them independently from the circuit matrices — this is what prevents the prover from supplying crafted parameters.
 
 ### 7.4 Participant Interface
 
 ```rust
-/// The optimizer callback: takes C⁰, returns (C*, witness_builder)
-pub type OptimizeCircuitFn = fn(&Circuit) -> (Circuit, Box<dyn WitnessBuilder>);
-
-/// Participants implement this to compute witnesses for their C*
-pub trait WitnessBuilder: Send + Sync {
-    fn build_witness(&self, public_inputs: &[Scalar]) -> Result<(Vec<Scalar>, Vec<Scalar>)>;
-    // Returns (private_vars, public_io) matching C*'s layout
-}
+/// Takes C⁰, returns C* with strictly fewer constraints.
+/// C* rows must be in topological evaluation order.
+/// See OptimizeCircuitFn rustdoc for full requirements.
+pub type OptimizeCircuitFn = fn(&SpartanInstance) -> SpartanInstance;
 ```
 
 ---
@@ -419,8 +417,8 @@ pub trait WitnessBuilder: Send + Sync {
            → (vars0: 997 Scalars, public_io0: 152 Scalars)
               public_io0 = [y0_out_0, y0_out_1, y0_out_2, x_eval_0, ..., x_eval_148]
 
-   For C*: witness_builder.build_witness(&x_eval)
-           → (vars_star, public_io_star)
+   For C*: solve_witness_forward(&circuit_star, num_outputs, &x_eval)
+           → (vars_star, public_io_star)   [single pass; errors if rows not in order]
 
 5. PROOF GENERATION (Prover only, expensive)
    ─────────────────────────────────────────
@@ -583,9 +581,12 @@ To ensure fairness (different seeds at the same δ should present comparable dif
 
 ## 12. Known Issues and Remaining Work
 
-### Bug Fixed
+### Completed
 
-- **`Circuit::num_non_zero()`** was returning the **sum** of non-zero entries across A, B, C matrices. Spartan's `SNARKGens::new` expects the **maximum** across the three. This caused a panic during proof generation. **Fixed**: now returns `A.len().max(B.len()).max(C.len())`.
+- **`Circuit` → `SpartanInstance`**: The custom `Circuit` wrapper has been removed. `Challenge` and `Solution` now use `SpartanInstance` from `tig-circuit-tools` directly, giving challengers access to libspartan utilities like `Instance::is_sat()`.
+- **Topological row order**: `dag_to_spartan` now emits rows in topological evaluation order (reverse node-ID). `solve_witness_forward` (single O(n) pass) replaces `solve_witness_from_r1cs` (O(n²) fixed-point) as the witness solver for C*.
+- **Order enforcement**: `solve_challenge` uses `solve_witness_forward` for C*. A circuit with out-of-order rows is rejected immediately with `WitnessError::NotInEvaluationOrder { row }`.
+- **Alias optimizer end-to-end**: `remove_aliases` is fully tested in `test_alias_optimizer_roundtrip` — generates challenge, optimizes, proves, verifies.
 
 ### Remaining Integration Work
 
@@ -596,12 +597,9 @@ To ensure fairness (different seeds at the same δ should present comparable dif
 | `tig-algorithms` feature name | Bug | `lib.rs` gates on `c006`, `Cargo.toml` defines `c007` |
 | `tig-algorithms/src/zk/` | Missing | No participant algorithm stubs exist yet |
 | `Solution` wire format | Missing | `zk::Solution` needs `From`/`TryFrom` conversions for the protocol's JSON map format |
-| Reference optimizer | Missing | No reference implementation of `OptimizeCircuitFn` |
-| Integration test with real optimization | Future | Current test uses identity (C*=C⁰), need test with K* < K⁰ |
 | `tig-circuit-tools` branch reference | Needs update | Cargo.toml points to `branch = "feat/witness-generation"` — update to `main` after PR merge |
 
 ### Future Enhancements
 
 - **Release build benchmarks**: Debug mode dominates current timing; release builds needed for realistic performance numbers
 - **Larger difficulty tests**: Validate scaling behavior at δ=2, 5, 10
-- **Optimizer reference implementation**: Even a trivial alias-removal optimizer would exercise the full pipeline including K* < K⁰
